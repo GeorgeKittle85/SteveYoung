@@ -1,0 +1,19 @@
+# Cloudflare Tunnel credentials — these authenticate as your tunnel and your
+# Cloudflare account. Never commit them.
+*.json.cloudflared
+cert.pem
+.cloudflared/
+cloudflare/*.json
+cloudflare/cert.pem
+
+# Local overrides
+docker-compose.override.yml
+.env
+
+# nginx backups created by scripts/setup-nginx.sh
+*.backup.*
+
+# Editor / OS noise
+.DS_Store
+*.swp
+__pycache__/
