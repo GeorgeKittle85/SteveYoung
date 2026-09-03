@@ -32,6 +32,7 @@ without opening a single inbound port.
 | `docker-compose.yml` | Local test rig for `nginx.conf` itself, with three mock backends |
 | `docker/mock-backend/server.py` | Dependency-free mock backend (HTTP + WebSocket echo) |
 | `docker-compose.browser.yml` | **The actual production service**: a containerized, remotely-driven Firefox — see [Remote browser service](#remote-browser-service) below |
+| `.env` (not committed) | `BROWSER_USER` / `BROWSER_PASSWORD` — the browser container's own login. Create it yourself; `.gitignore` covers it |
 
 Routing that the shipped config implements by default (the generic template):
 
@@ -58,11 +59,21 @@ byte of actual browsing (page content, downloads, any exploit a malicious
 site throws) stays inside that container's own throwaway storage — never the
 host's filesystem.
 
+**What that does and does not cover.** The filesystem guarantee is real: the
+container has one named Docker volume and no host bind mount, so nothing a
+session does becomes a file on this Mac. It is *not* a network boundary. From
+inside the container you can reach this Mac's listening services (including
+SSH and nginx, via `host.docker.internal`, which Docker Desktop NATs into the
+host's **loopback**), every other device on the LAN, the router, and the open
+internet. Read the isolation as "the host's filesystem is unreachable", not
+"the host is unreachable".
+
 | Piece | What it does |
 | ----- | ------------- |
 | `docker-compose.browser.yml` | Runs the container, loopback-only (`127.0.0.1:3000`), with resource limits (`2 CPUs` / `2GB` / `512 pids`), `no-new-privileges`, and a **named Docker volume** for `/config` — not a host bind mount, so nothing a session does becomes a file on this Mac |
 | `nginx/nginx.conf` | `px.tinyorbit.org`'s server block proxies everything (UI + the WebSocket stream that carries frames/input) straight to that container — see the file's own comments |
-| Cloudflare Access | Gates the hostname before traffic ever reaches the tunnel — email one-time-PIN login, allow-listed via the `Proxy-Users` reusable Access policy in the Zero Trust dashboard. Nginx itself has no auth logic; Access is the enforcement point |
+| Cloudflare Access | Gates the hostname at the Cloudflare **edge** — email one-time-PIN login, allow-listed via the `Proxy-Users` reusable Access policy in the Zero Trust dashboard. This is the front door, but it only sees traffic that arrives through Cloudflare |
+| Container login (`.env`) | The origin-side gate. `CUSTOM_USER` / `PASSWORD` from a gitignored `.env` put HTTP basic auth on the container itself, so reaching port 3000 or nginx directly — which any process on this Mac and any other container can do — is not enough to drive the browser. Expect to enter it once after the Access login |
 | `scripts/reset-browser.sh` | One command to wipe the shared profile/downloads/cookies and start clean |
 
 Known v1 limitations, not bugs:
@@ -70,10 +81,27 @@ Known v1 limitations, not bugs:
 - **One shared session.** Everyone who logs in sees and drives the same
   browser — there's no per-user isolation yet. Fine for a small trusted
   group; a bigger group would want per-user ephemeral containers instead.
-- **LAN reachability.** The container can still reach other devices on the
-  local network (normal Docker bridge egress, the same as any browser on
-  this Mac could) — the isolation guarantee is specifically "the host's own
-  filesystem and processes are unreachable," not full network segmentation.
+- **LAN and host reachability.** The container reaches other devices on the
+  local network, the router, and this Mac's own listening services through
+  `host.docker.internal` — normal Docker bridge egress, the same as any
+  browser on this Mac. The isolation guarantee is specifically "the host's
+  filesystem is unreachable," not network segmentation.
+
+### Credentials
+
+`docker-compose.browser.yml` reads the container's login from a `.env` file
+beside it. `.gitignore` already covers `.env`, so it never reaches git:
+
+```bash
+cat > .env <<'EOF'
+BROWSER_USER=px
+BROWSER_PASSWORD=<a long random string>
+EOF
+chmod 600 .env
+```
+
+Compose refuses to start without both values rather than silently bringing up
+an unauthenticated browser. To rotate, edit `.env` and re-run `up -d`.
 
 Bring it up/down with the rest of the stack via `scripts/start.sh` /
 `scripts/stop.sh`, or directly:
@@ -278,31 +306,39 @@ The mock backends join nginx's network namespace, so `127.0.0.1:3000/:3001/:5000
 resolve inside the nginx container exactly as on a real host — the config runs
 unmodified, with no Docker-specific upstream names.
 
-nginx is published on **`localhost:8080`**. Every request needs a `Host` header:
+nginx binds `127.0.0.1:80` inside the container, so a plain `-p 8080:80`
+publish would forward to the container's eth0 and reach nothing — every test
+would return `Empty reply from server`, which is also what a correctly-dropped
+unknown Host looks like. A `socat` sidecar (`mock-portproxy`) relays
+`eth0:8080` to `127.0.0.1:80` so the rig actually exercises the config.
+
+nginx is published on **`localhost:8080`**. Every request needs a `Host` header
+matching a `server_name` that exists in `nginx.conf` — today that is
+`px.tinyorbit.org`:
 
 ```bash
 # Health (answered by nginx itself)
-curl -H 'Host: example.com' http://localhost:8080/health
+curl -H 'Host: px.tinyorbit.org' http://localhost:8080/health
 
 # Load balancing — run it a few times, watch "backend" alternate
-curl -H 'Host: example.com' http://localhost:8080/
+curl -H 'Host: px.tinyorbit.org' http://localhost:8080/
 
 # Proxy headers actually forwarded (null means nginx is not sending it)
-curl -H 'Host: example.com' http://localhost:8080/ | grep -A9 proxy_headers
+curl -H 'Host: px.tinyorbit.org' http://localhost:8080/ | grep -A9 proxy_headers
 
 # API routing, both ways in
 curl -H 'Host: example.com'     http://localhost:8080/api/v1/users
 curl -H 'Host: api.example.com' http://localhost:8080/v1/users
 
 # Static caching → Cache-Control: public, max-age=2592000, immutable
-curl -I -H 'Host: example.com' http://localhost:8080/assets/app.css
+curl -I -H 'Host: px.tinyorbit.org' http://localhost:8080/assets/app.css
 
 # Unknown Host is dropped → "Empty reply from server" (444, by design)
 curl -H 'Host: nope.test' http://localhost:8080/
 
 # Upstream failover — traffic shifts to app-2, no errors
 docker compose stop app-1
-curl -H 'Host: example.com' http://localhost:8080/
+curl -H 'Host: px.tinyorbit.org' http://localhost:8080/
 docker compose start app-1
 ```
 
@@ -654,7 +690,29 @@ the distro's `default.conf` first, or you will get a duplicate default server.
 
 - **`CF-Connecting-IP` is trusted only from listed addresses.** That is what
   makes it safe to key rate limits on. Do not add public ranges to
-  `set_real_ip_from`.
+  `set_real_ip_from`. Note that the commented-out `set_real_ip_from
+  172.16.0.0/12` in `nginx.conf` is *not* free either: enabling it lets any
+  container on this host spoof `CF-Connecting-IP`, and so evade `limit_conn`
+  and any IP-based `allow`/`deny`. Only uncomment it when nginx itself runs in
+  Docker and that bridge range is genuinely the tunnel's source address.
+
+- **Loopback is not a boundary against containers on this host.** Docker
+  Desktop for Mac NATs `host.docker.internal` into the host's loopback, so a
+  `listen 127.0.0.1:80` binding is reachable from any container — nginx even
+  sees those connections as `127.0.0.1`, which is why the `allow 127.0.0.1`
+  ACL on `/nginx-status` does not exclude them. Consequences:
+
+  - Cloudflare Access is enforced at the Cloudflare **edge**. Anything that
+    reaches nginx or port 3000 locally bypasses it entirely.
+  - That is precisely why the browser container carries its own
+    `CUSTOM_USER`/`PASSWORD` login. Access is the front door; the container
+    login is what makes the local path useless to an attacker. Do not remove
+    it, and do not have nginx inject the credentials on the proxied request —
+    that would hand the bypass straight back.
+
+- **Two gates, deliberately.** Signing in means an Access login *and* the
+  container's basic-auth prompt. The second one is the one that still protects
+  you if Access is misconfigured, disabled, or bypassed locally.
 
 - **Consider Cloudflare Access** for admin routes — it puts SSO in front of a
   hostname or path with no application changes:

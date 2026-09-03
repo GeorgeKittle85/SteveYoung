@@ -117,6 +117,13 @@ nginx is where per-request policy is applied. In order:
    show only the loopback address and — worse — every visitor would share a
    single rate-limit bucket. This is why the `real_ip` block comes first.
 
+   This is safe only because Cloudflare's edge overwrites `CF-Connecting-IP`
+   on every inbound request, so a visitor cannot forge it. It stops being safe
+   for any client that reaches nginx *without* passing through Cloudflare — on
+   Docker Desktop for Mac that includes every local container, which reaches
+   the host's loopback via `host.docker.internal` and is seen by nginx as
+   `127.0.0.1`. Treat the edge, not the bind address, as the trust boundary.
+
 2. **Virtual host selection** by `Host` header:
    `example.com` / `www.example.com` → the app vhost, `api.example.com` → the
    API vhost, anything else → `return 444` (connection dropped, no response).

@@ -82,6 +82,16 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# The domain is interpolated into a `sed` replacement below. Unvalidated, a `|`
+# breaks out of the s||| delimiters (aborting mid-rewrite) and an `&` expands to
+# the matched text, silently corrupting the config. Hostnames cannot legitimately
+# contain either, so reject anything that is not a plain DNS name.
+if [[ -n "${TUNNEL_DOMAIN}" ]]; then
+    if ! [[ "${TUNNEL_DOMAIN}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
+        die "Invalid --domain: '${TUNNEL_DOMAIN}'. Expected a DNS hostname, e.g. example.com"
+    fi
+fi
+
 SUDO=""
 if [[ ${EUID} -ne 0 ]] && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
 
@@ -89,6 +99,30 @@ if [[ ${EUID} -ne 0 ]] && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
 #  1. Install cloudflared
 # ---------------------------------------------------------------------------
 step "Checking for cloudflared"
+# Pinned rather than `latest`: these artifacts are installed as root, and
+# Cloudflare publishes no checksum file alongside the GitHub release, so an
+# unpinned `latest` download is an unverified root install of whatever is
+# upstream at that moment. Override deliberately:
+#   CLOUDFLARED_VERSION=2026.8.3 ./scripts/setup-cloudflare-tunnel.sh
+# Set CLOUDFLARED_SHA256 to have the download verified against a hash you
+# obtained out of band.
+CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-2026.8.3}"
+CLOUDFLARED_SHA256="${CLOUDFLARED_SHA256:-}"
+
+verify_checksum() {
+    local file="$1"
+    if [[ -z "${CLOUDFLARED_SHA256}" ]]; then
+        warn "CLOUDFLARED_SHA256 not set — installing ${file##*/} without checksum verification."
+        warn "Cloudflare publishes no checksums for these artifacts; the apt path below is GPG-signed and preferred."
+        return 0
+    fi
+    local actual
+    actual="$(sha256sum "${file}" 2>/dev/null | awk '{print $1}' || shasum -a 256 "${file}" | awk '{print $1}')"
+    [[ "${actual}" == "${CLOUDFLARED_SHA256}" ]] \
+        || die "Checksum mismatch for ${file}: expected ${CLOUDFLARED_SHA256}, got ${actual}"
+    ok "Checksum verified."
+}
+
 install_cloudflared() {
     local os arch pkg url
     os="$(uname -s)"; arch="$(uname -m)"
@@ -97,6 +131,23 @@ install_cloudflared() {
         command -v brew >/dev/null 2>&1 || die "Install Homebrew, or download cloudflared manually."
         brew install cloudflared
         return
+    fi
+
+    # Preferred on Debian/Ubuntu: Cloudflare's own apt repository is GPG-signed,
+    # so apt verifies the package signature and the OS can keep it updated.
+    # This is the only path here with real supply-chain verification.
+    if command -v apt-get >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1; then
+        info "Installing from Cloudflare's signed apt repository."
+        $SUDO mkdir -p --mode=0755 /usr/share/keyrings
+        if curl -fsSL --retry 3 https://pkg.cloudflare.com/cloudflare-main.gpg \
+             | $SUDO tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null; then
+            echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
+                | $SUDO tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+            if $SUDO apt-get update -qq && $SUDO apt-get install -y cloudflared; then
+                return
+            fi
+        fi
+        warn "Signed apt repository unavailable — falling back to a pinned direct download."
     fi
 
     case "${arch}" in
@@ -110,23 +161,26 @@ install_cloudflared() {
     # Prefer the native package so the OS can update it later.
     if command -v dpkg >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
         pkg="$(mktemp -t cloudflared-XXXXXX.deb)"
-        url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb"
+        url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}.deb"
         info "Downloading ${url}"
         curl -fsSL --retry 3 -o "${pkg}" "${url}"
+        verify_checksum "${pkg}"
         $SUDO dpkg -i "${pkg}" || { $SUDO apt-get install -f -y && $SUDO dpkg -i "${pkg}"; }
         rm -f "${pkg}"
     elif command -v rpm >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
         pkg="$(mktemp -t cloudflared-XXXXXX.rpm)"
-        url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.rpm"
+        url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}.rpm"
         info "Downloading ${url}"
         curl -fsSL --retry 3 -o "${pkg}" "${url}"
+        verify_checksum "${pkg}"
         $SUDO rpm -i --replacepkgs "${pkg}"
         rm -f "${pkg}"
     else
         # Fall back to the raw binary.
-        url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
+        url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}"
         info "Downloading ${url}"
         curl -fsSL --retry 3 -o /tmp/cloudflared "${url}"
+        verify_checksum /tmp/cloudflared
         chmod +x /tmp/cloudflared
         $SUDO install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
         rm -f /tmp/cloudflared
@@ -211,6 +265,7 @@ step "Installing ${DEST_CONFIG}"
 if [[ -f "${DEST_CONFIG}" ]]; then
     BACKUP="${DEST_CONFIG}.backup.$(date +%Y%m%d-%H%M%S)"
     cp -f "${DEST_CONFIG}" "${BACKUP}"
+    chmod 600 "${BACKUP}"   # the config names the credentials path; don't leave it 0644
     ok "Backed up existing config to ${BACKUP}"
 fi
 

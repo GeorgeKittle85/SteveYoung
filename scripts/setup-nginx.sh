@@ -132,6 +132,7 @@ if [[ -f "${DEST_CONF}" ]]; then
         info "Destination already matches the repo config — nothing to back up."
     else
         $SUDO cp -f "${DEST_CONF}" "${CANDIDATE}"
+        $SUDO chmod 600 "${CANDIDATE}" 2>/dev/null || true
         ${DRY_RUN} || BACKUP_CONF="${CANDIDATE}"
         ok "Backed up existing config to ${CANDIDATE}"
     fi
@@ -150,6 +151,11 @@ $SUDO mkdir -p /var/log/nginx
 # Distro packages ship a default vhost that binds :80 as well. This config is
 # self-contained (it does not include conf.d/ or sites-enabled/), so those files
 # are inert — but say so, because people expect them to be in play.
+#
+# This matters more than it looks: replacing nginx.conf wholesale takes every
+# OTHER site on this host offline, because none of their vhosts are included.
+# On a machine that serves more than this project, deploy this as an included
+# fragment instead of as /etc/nginx/nginx.conf.
 for d in /etc/nginx/conf.d /etc/nginx/sites-enabled; do
     if [[ -d "${d}" ]] && compgen -G "${d}/*" >/dev/null 2>&1; then
         info "Note: ${d} is NOT included by this config; files there are ignored."
@@ -222,12 +228,13 @@ cat <<EOF
 ${GREEN}${BOLD}nginx is set up.${RESET}
 
 ${BOLD}Next steps${RESET}
-  1. Replace the placeholder domain:
-       sudo sed -i 's/example\.com/yourdomain.com/g' ${DEST_CONF}
+  1. Point the vhost at your own hostname if it is not px.tinyorbit.org:
+       sudo sed -i 's/px\.tinyorbit\.org/yourdomain.com/g' ${DEST_CONF}
        sudo nginx -t && sudo systemctl reload nginx
 
-  2. Start your backends on 127.0.0.1:3000, :3001 and :5000
-     (or edit the \`upstream\` blocks in ${DEST_CONF}).
+  2. Start the browser container on 127.0.0.1:3000
+     (or edit the \`upstream browser_backend\` block in ${DEST_CONF}):
+       docker compose -f docker-compose.browser.yml up -d --wait
 
   3. Create the Cloudflare Tunnel:
        ./scripts/setup-cloudflare-tunnel.sh
@@ -242,5 +249,5 @@ ${BOLD}Handy commands${RESET}
   sudo tail -f /var/log/nginx/access.log
   sudo tail -f /var/log/nginx/error.log
   curl -H 'Host: px.tinyorbit.org' http://127.0.0.1/health
-  curl http://127.0.0.1/nginx-status # active connections / requests
+  curl -H 'Host: px.tinyorbit.org' http://127.0.0.1/nginx-status  # connections
 EOF
