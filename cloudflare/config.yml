@@ -19,7 +19,10 @@ tunnel: REPLACE_WITH_TUNNEL_ID
 
 # Credentials minted by `cloudflared tunnel create`. This file is a secret —
 # it authenticates as the tunnel. Never commit it.
-credentials-file: /root/.cloudflared/REPLACE_WITH_TUNNEL_ID.json
+# The setup script rewrites this to the real path. It is ~/.cloudflared/<id>.json
+# for a user-run tunnel and /etc/cloudflared/<id>.json for the system service —
+# not /root/ unless you actually run as root.
+credentials-file: REPLACE_WITH_CREDENTIALS_PATH
 
 # --- Connection tuning -------------------------------------------------------
 # Four edge connections (the default) spread over two Cloudflare data centres.
@@ -27,7 +30,9 @@ protocol: quic
 loglevel: info
 transport-loglevel: warn
 no-autoupdate: true
-metrics: 127.0.0.1:20241        # Prometheus metrics + /ready health endpoint
+metrics: 127.0.0.1:20242        # Prometheus metrics + /ready health endpoint
+                                # Must be unique per tunnel on a host that runs
+                                # several; 20241 is taken by another tunnel here.
 retries: 5
 grace-period: 30s
 

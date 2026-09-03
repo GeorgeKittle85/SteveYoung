@@ -12,6 +12,7 @@ Speaks just enough HTTP and WebSocket to prove the proxy works:
 
 Configured entirely through the environment:
   PORT          TCP port to listen on            (default 3000)
+  BIND_HOST     address to bind                  (default 127.0.0.1)
   BACKEND_NAME  name reported in responses       (default backend)
   ENABLE_WS     accept WebSocket upgrades        (default true)
 """
@@ -26,6 +27,10 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", "3000"))
+# Loopback by default. In the compose rig every backend shares nginx's network
+# namespace, so 127.0.0.1 is exactly what nginx dials — binding 0.0.0.0 only
+# widened the exposure if anyone ran this file directly on a real host.
+BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")
 BACKEND_NAME = os.environ.get("BACKEND_NAME", "backend")
 ENABLE_WS = os.environ.get("ENABLE_WS", "true").lower() in ("1", "true", "yes")
 
@@ -34,6 +39,11 @@ ENABLE_WS = os.environ.get("ENABLE_WS", "true").lower() in ("1", "true", "yes")
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x1, 0x2, 0x8, 0x9, 0xA
+
+# A frame header can declare a payload of up to 2**64-1 bytes. Reading that
+# length back unconditionally lets one client park a thread in a blocking read
+# forever (ThreadingHTTPServer caps nothing), so refuse oversized frames.
+MAX_FRAME_BYTES = 1 << 20  # 1 MiB — far more than this echo server needs
 
 # Headers nginx is expected to set; echoed back so you can confirm each one.
 PROXY_HEADERS = (
@@ -166,6 +176,9 @@ class Handler(BaseHTTPRequestHandler):
             length = struct.unpack(">H", self.rfile.read(2))[0]
         elif length == 127:
             length = struct.unpack(">Q", self.rfile.read(8))[0]
+        if length > MAX_FRAME_BYTES:
+            log(f"frame of {length} bytes exceeds {MAX_FRAME_BYTES} — closing")
+            return OP_CLOSE, b""
         mask = self.rfile.read(4) if masked else b""
         payload = self.rfile.read(length) if length else b""
         if masked:
@@ -189,9 +202,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     server.daemon_threads = True
-    log(f"listening on 0.0.0.0:{PORT} (websockets {'on' if ENABLE_WS else 'off'})")
+    log(f"listening on {BIND_HOST}:{PORT} (websockets {'on' if ENABLE_WS else 'off'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

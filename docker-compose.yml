@@ -16,6 +16,15 @@
 #  a real host, so nginx.conf runs here byte-for-byte identical to production —
 #  no Docker-specific upstream names, no second copy of the config to drift.
 #  Because they share one namespace, only the nginx service publishes ports.
+#
+#  That byte-for-byte fidelity has one consequence: nginx.conf binds
+#  `127.0.0.1:80`, but a published port (`-p 8080:80`) forwards to the
+#  container's *eth0*, which nothing is listening on — so every request to
+#  localhost:8080 used to come back "Empty reply from server", the exact
+#  symptom SETUP.md describes as expected for an unknown Host. The rig looked
+#  like it was working while testing nothing. The `portproxy` sidecar below
+#  bridges that gap: it shares the namespace and relays eth0:8080 into
+#  127.0.0.1:80, leaving nginx.conf untouched.
 # =============================================================================
 
 services:
@@ -24,16 +33,19 @@ services:
   #  so it does not collide with anything already running on the host.
   # ---------------------------------------------------------------------------
   nginx:
-    image: nginx:1.27-alpine
+    image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10   # nginx:1.27-alpine
     container_name: mock-nginx
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:8080"   # -> portproxy sidecar -> nginx on 127.0.0.1:80
     volumes:
       # Read-only: the container must never be able to edit the repo copy.
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     healthcheck:
       # Unknown Host headers get 444 by design, so the probe sends a real one.
-      test: ["CMD", "wget", "-q", "--spider", "--header=Host: example.com", "http://127.0.0.1/health"]
+      # It must match a server_name that actually exists in nginx.conf — this
+      # said `example.com`, which the config no longer serves, so the rig sat
+      # permanently (unhealthy).
+      test: ["CMD", "wget", "-q", "--spider", "--header=Host: px.tinyorbit.org", "http://127.0.0.1/health"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -41,11 +53,24 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
+  #  Publishes the loopback-bound nginx so the documented curl commands work.
+  #  Without this the rig silently tests nothing — see the networking note above.
+  # ---------------------------------------------------------------------------
+  portproxy:
+    image: alpine/socat@sha256:5f275aa1b6e9889c851f61097142ee050fc6ac4615b4ea64ac1f2b0e81ff8d7f
+    container_name: mock-portproxy
+    network_mode: "service:nginx"
+    depends_on:
+      - nginx
+    command: ["TCP-LISTEN:8080,fork,reuseaddr", "TCP:127.0.0.1:80"]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
   #  App tier — two instances, load balanced by `least_conn`. Hit / repeatedly
   #  and watch the `backend` field in the JSON alternate between them.
   # ---------------------------------------------------------------------------
   app-1:
-    image: python:3.12-alpine
+    image: python@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a  # python:3.12-alpine
     container_name: mock-app-1
     network_mode: "service:nginx"
     depends_on:
@@ -68,7 +93,7 @@ services:
     restart: unless-stopped
 
   app-2:
-    image: python:3.12-alpine
+    image: python@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a  # python:3.12-alpine
     container_name: mock-app-2
     network_mode: "service:nginx"
     depends_on:
@@ -95,7 +120,7 @@ services:
   #  api.example.com.
   # ---------------------------------------------------------------------------
   api:
-    image: python:3.12-alpine
+    image: python@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a  # python:3.12-alpine
     container_name: mock-api
     network_mode: "service:nginx"
     depends_on:
@@ -125,15 +150,27 @@ services:
   #  Requires ~/.cloudflared to already hold a config.yml and credentials —
   #  run scripts/setup-cloudflare-tunnel.sh first. Point the ingress rules at
   #  http://localhost:80 (this container shares nginx's namespace too).
+  #
+  #  Mount ONE config and ONE credentials file, never the whole ~/.cloudflared
+  #  directory: that directory also holds cert.pem, which is an account/zone
+  #  level credential (it can create tunnels and DNS records), plus the
+  #  credentials of every other tunnel on this machine. Set TUNNEL_ID to the
+  #  tunnel you want this rig to run:
+  #
+  #    TUNNEL_ID=<uuid> docker compose --profile tunnel up
   # ---------------------------------------------------------------------------
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared@sha256:51c9cefcb4569df44e1ad403ab1d3d8065aa8e84339bcfc6aee75502e1140339  # :latest at pin time
     container_name: mock-cloudflared
     profiles: ["tunnel"]
     network_mode: "service:nginx"
     depends_on:
       - nginx
     volumes:
-      - ${HOME}/.cloudflared:/etc/cloudflared:ro
+      - ${HOME}/.cloudflared/config.yml:/etc/cloudflared/config.yml:ro
+      # A default that cannot exist, so forgetting TUNNEL_ID fails loudly on
+      # this profile instead of silently mounting the wrong thing. It is only
+      # interpolated (not required) so the default rig still starts without it.
+      - ${HOME}/.cloudflared/${TUNNEL_ID:-TUNNEL_ID_IS_NOT_SET}.json:/etc/cloudflared/${TUNNEL_ID:-TUNNEL_ID_IS_NOT_SET}.json:ro
     command: ["tunnel", "--config", "/etc/cloudflared/config.yml", "--no-autoupdate", "run"]
     restart: unless-stopped

@@ -14,11 +14,19 @@
 #    docker compose -f docker-compose.browser.yml down
 #
 #  Pair with scripts/start.sh / scripts/stop.sh, which already run these.
+#
+#  Requires a .env file next to this one (gitignored) holding BROWSER_USER and
+#  BROWSER_PASSWORD — see SETUP.md -> "Remote browser service".
 # =============================================================================
 
 services:
   browser:
-    image: lscr.io/linuxserver/firefox:latest
+    # Pinned by digest, not `:latest`. This container renders hostile web
+    # content as its whole job, so a silent upstream image swap on the next
+    # pull is a real supply-chain risk. Update deliberately:
+    #   docker pull lscr.io/linuxserver/firefox:latest
+    #   docker image inspect --format '{{index .RepoDigests 0}}' lscr.io/linuxserver/firefox:latest
+    image: lscr.io/linuxserver/firefox@sha256:b1ab39da8014347ee5a02fed869632c1e4fae2be803228b88b99bccc04b68cd3
     container_name: px-browser
     restart: unless-stopped
 
@@ -26,21 +34,47 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=America/Los_Angeles
+      # The image's init tries to mknod virtual gamepad nodes (/dev/input/js*).
+      # With CAP_MKNOD dropped that fails and logs an error; a browsing proxy
+      # has no use for gamepads, so skip it via the image's own switch rather
+      # than granting the capability back.
+      - NO_GAMEPAD=true
+      # The container's own login gate. Cloudflare Access is the front door,
+      # but it is enforced at the Cloudflare edge — anything that reaches this
+      # container's port directly (any process on this Mac, and any other
+      # container via host.docker.internal) skips Access entirely. This is the
+      # second, origin-side gate that makes that bypass useless.
+      - CUSTOM_USER=${BROWSER_USER:?set BROWSER_USER in .env}
+      - PASSWORD=${BROWSER_PASSWORD:?set BROWSER_PASSWORD in .env}
 
     # Loopback only — nothing but nginx on this host can reach it, same
-    # convention as every other backend upstream in nginx.conf.
+    # convention as every other backend upstream in nginx.conf. Note this is
+    # not a boundary against other containers: Docker Desktop for Mac NATs
+    # host.docker.internal into the host's loopback. Hence CUSTOM_USER above.
     ports:
       - "127.0.0.1:3000:3000"
 
     # linuxserver's documented minimum for modern sites (video playback etc.)
     shm_size: "1gb"
 
-    # Cheap, safe hardening that doesn't risk breaking the KasmVNC/s6-overlay
-    # boot sequence (unlike cap_drop/read_only, which these images generally
-    # need default capabilities and a writable rootfs to even start — worth
-    # revisiting once this is confirmed working).
     security_opt:
       - no-new-privileges:true
+
+    # The image's s6-overlay init needs root to set up /config and drop to
+    # PUID/PGID, so the container cannot simply run as a non-root user. Drop
+    # the ambient capability set instead and add back only what that boot
+    # sequence actually uses — verified booting with exactly this list.
+    # Notably this removes CAP_NET_RAW (raw sockets: ARP spoofing / packet
+    # crafting on the Docker network) and CAP_SYS_CHROOT / CAP_MKNOD.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN            # s6 fixing ownership of /config
+      - DAC_OVERRIDE     # s6 writing into root-owned paths before dropping
+      - FOWNER
+      - SETUID           # dropping from root to PUID
+      - SETGID
+      - KILL             # s6 supervising and stopping services
 
     # Bound so a hostile page can't turn this into a resource-exhaustion
     # vector for the rest of the host. Docker Desktop's VM only has 4 CPUs /

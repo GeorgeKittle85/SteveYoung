@@ -40,19 +40,34 @@ FAILED=false
 #  1. Cloudflare Tunnel
 # ---------------------------------------------------------------------------
 step "Cloudflare Tunnel"
-if [[ -f "${TUNNEL_PID_FILE}" ]] && kill -0 "$(cat "${TUNNEL_PID_FILE}")" 2>/dev/null; then
-    PID="$(cat "${TUNNEL_PID_FILE}")"
+# A pid file can outlive the process it names, and PIDs get recycled — so
+# confirm the process is actually cloudflared before signalling it. Without
+# this check a stale pid file makes this script SIGKILL an unrelated process.
+is_our_tunnel() {
+    local pid="$1"
+    [[ -n "${pid}" ]] || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    ps -o command= -p "${pid}" 2>/dev/null | grep -q 'cloudflared'
+}
+
+PID="$(cat "${TUNNEL_PID_FILE}" 2>/dev/null || true)"
+if is_our_tunnel "${PID}"; then
     kill "${PID}"
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         kill -0 "${PID}" 2>/dev/null || break
         sleep 1
     done
-    if kill -0 "${PID}" 2>/dev/null; then
+    # Re-check identity before escalating: between SIGTERM and here the pid
+    # could have been freed and reused.
+    if is_our_tunnel "${PID}"; then
         warn "Tunnel (pid ${PID}) did not exit in time — sending SIGKILL."
         kill -9 "${PID}" 2>/dev/null || true
     fi
     rm -f "${TUNNEL_PID_FILE}"
     ok "Tunnel stopped."
+elif [[ -n "${PID}" ]]; then
+    warn "Stale pid file: pid ${PID} is not a cloudflared process. Not signalling it."
+    rm -f "${TUNNEL_PID_FILE}"
 else
     info "Tunnel not running."
     rm -f "${TUNNEL_PID_FILE}"
