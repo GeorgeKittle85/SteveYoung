@@ -42,7 +42,7 @@ fi
 
 # nginx is the origin for every ingress rule — warn early rather than serving 502s.
 if command -v curl >/dev/null 2>&1; then
-    if ! curl -fsS -m 3 -H 'Host: example.com' http://127.0.0.1/health >/dev/null 2>&1; then
+    if ! curl -fsS -m 3 -H 'Host: px.tinyorbit.org' http://127.0.0.1/health >/dev/null 2>&1; then
         warn "nginx did not answer on http://127.0.0.1/health — the tunnel will return 502 until it does."
         warn "Start it with: sudo systemctl start nginx"
     fi

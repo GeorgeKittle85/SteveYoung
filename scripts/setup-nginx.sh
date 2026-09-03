@@ -140,6 +140,13 @@ fi
 $SUDO install -m 0644 "${SRC_CONF}" "${DEST_CONF}"
 ok "Config installed."
 
+# nginx.conf logs to the standard /var/log/nginx/ path (needed for the custom
+# `main` log_format — see SETUP.md's "Logs and monitoring"). Distro packages
+# create this directory themselves; Homebrew's nginx on macOS does not, so
+# `nginx -t` fails with "open() ... failed (2: No such file or directory)"
+# unless it exists first.
+$SUDO mkdir -p /var/log/nginx
+
 # Distro packages ship a default vhost that binds :80 as well. This config is
 # self-contained (it does not include conf.d/ or sites-enabled/), so those files
 # are inert — but say so, because people expect them to be in play.
@@ -200,8 +207,8 @@ if ${START_SERVICE} && ! ${DRY_RUN} && command -v curl >/dev/null 2>&1; then
     step "Smoke test"
     # The default server answers unknown Hosts with 444 (connection closed), so
     # the probe must send a Host header that matches a configured vhost.
-    if curl -fsS -m 5 -H 'Host: example.com' http://127.0.0.1/health >/dev/null 2>&1; then
-        ok "http://127.0.0.1/health responded (Host: example.com)."
+    if curl -fsS -m 5 -H 'Host: px.tinyorbit.org' http://127.0.0.1/health >/dev/null 2>&1; then
+        ok "http://127.0.0.1/health responded (Host: px.tinyorbit.org)."
     else
         warn "Health endpoint did not respond yet. Check: journalctl -u nginx -n 50"
     fi
@@ -234,6 +241,6 @@ ${BOLD}Handy commands${RESET}
   sudo systemctl reload nginx        # apply changes with zero downtime
   sudo tail -f /var/log/nginx/access.log
   sudo tail -f /var/log/nginx/error.log
-  curl -H 'Host: example.com' http://127.0.0.1/health
+  curl -H 'Host: px.tinyorbit.org' http://127.0.0.1/health
   curl http://127.0.0.1/nginx-status # active connections / requests
 EOF

@@ -1,8 +1,10 @@
 # =============================================================================
 #  Cloudflare Tunnel configuration
 #
-#  Installed to ~/.cloudflared/config.yml by scripts/setup-cloudflare-tunnel.sh,
-#  which fills in the tunnel UUID and the credentials path for you.
+#  Deployed as ~/.cloudflared/config-px.yml on this host (a dedicated file per
+#  tunnel, alongside its other independent tunnels) with the tunnel UUID and
+#  credentials path filled in — see scripts/setup-cloudflare-tunnel.sh for the
+#  single-tunnel-host version of this flow.
 #
 #  cloudflared holds an outbound-only connection to the Cloudflare edge and
 #  forwards matching requests to the local nginx instance. No inbound firewall
@@ -34,17 +36,20 @@ grace-period: 30s
 #  Evaluated top to bottom; the FIRST match wins, so the catch-all must be last.
 #  Every rule except the catch-all needs a hostname (and may add a path regex).
 #
-#  All three hostnames point at the same local nginx on port 80 — nginx then
-#  routes by Host header and path (see nginx/nginx.conf). Keeping the routing
-#  in nginx means you change one file, not two, when a backend moves.
+#  This hostname points at the local nginx on port 80 — nginx then routes by
+#  path (see nginx/nginx.conf). Keeping the routing in nginx means you change
+#  one file, not two, when a backend moves.
 #
 ingress:
-  # ---- Apex domain ----------------------------------------------------------
-  - hostname: example.com
+  # ---- px.tinyorbit.org -------------------------------------------------------
+  # Everything for this tunnel goes through nginx on one hostname; /api/ and
+  # /ws/ under it already route to the api and websocket backends (see
+  # nginx/nginx.conf), so no separate api.px.tinyorbit.org rule is needed.
+  - hostname: px.tinyorbit.org
     service: http://localhost:80
     originRequest:
       # nginx picks the vhost from this header, so it must be preserved.
-      httpHostHeader: example.com
+      httpHostHeader: px.tinyorbit.org
       connectTimeout: 10s
       # Long enough for WebSockets and streaming responses to stay open.
       tcpKeepAlive: 30s
@@ -53,32 +58,9 @@ ingress:
       noTLSVerify: false
       disableChunkedEncoding: false
 
-  # ---- www ------------------------------------------------------------------
-  - hostname: www.example.com
-    service: http://localhost:80
-    originRequest:
-      httpHostHeader: www.example.com
-      connectTimeout: 10s
-      tcpKeepAlive: 30s
-      keepAliveTimeout: 90s
-      keepAliveConnections: 100
-
-  # ---- API ------------------------------------------------------------------
-  # Also reaches nginx, which proxies it to the :5000 backend. To bypass nginx
-  # and hit the API process directly, use `service: http://localhost:5000`.
-  - hostname: api.example.com
-    service: http://localhost:80
-    originRequest:
-      httpHostHeader: api.example.com
-      connectTimeout: 10s
-      tcpKeepAlive: 30s
-      keepAliveTimeout: 90s
-      keepAliveConnections: 100
-      # WebSocket upgrades pass through untouched; no extra setting is needed.
-
   # ---- Example: route one path to a different local service -----------------
   # Uncomment to send /metrics straight to a monitoring process, bypassing nginx.
-  # - hostname: example.com
+  # - hostname: px.tinyorbit.org
   #   path: ^/metrics
   #   service: http://localhost:9090
 
