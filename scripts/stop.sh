@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  stop.sh — stop the full local stack: the Cloudflare Tunnel + nginx.
+#  stop.sh — stop the full local stack: the Cloudflare Tunnel + the browser
+#            container + nginx.
 #
 #  Usage:
 #    ./scripts/stop.sh
 #
-#  Stops the tunnel first so no new public traffic arrives while nginx is
-#  going down, then quits nginx gracefully (in-flight requests finish first).
-#  Pair with scripts/start.sh.
+#  Stops the tunnel first so no new public traffic arrives while the rest is
+#  going down, then the browser container, then quits nginx gracefully
+#  (in-flight requests finish first). Pair with scripts/start.sh.
 # =============================================================================
 set -uo pipefail
 
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
 TUNNEL_PID_FILE="${HOME}/.cloudflared/px-tunnel.pid"
+BROWSER_COMPOSE="docker-compose.browser.yml"
 
 if [[ -t 1 ]]; then
     RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
@@ -55,7 +59,18 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-#  2. nginx
+#  2. Browser container
+# ---------------------------------------------------------------------------
+step "Browser container"
+if command -v docker >/dev/null 2>&1 && [[ -n "$(docker compose -f "${BROWSER_COMPOSE}" ps --quiet 2>/dev/null)" ]]; then
+    docker compose -f "${BROWSER_COMPOSE}" down
+    ok "Browser container stopped."
+else
+    info "Browser container not running."
+fi
+
+# ---------------------------------------------------------------------------
+#  3. nginx
 # ---------------------------------------------------------------------------
 step "nginx"
 if pgrep -f "nginx: master process" >/dev/null 2>&1; then

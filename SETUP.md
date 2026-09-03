@@ -22,15 +22,18 @@ without opening a single inbound port.
 
 | File | Purpose |
 | ---- | ------- |
-| `nginx/nginx.conf` | Production nginx config: reverse proxy, load balancing, rate limiting, WebSockets, static caching |
+| `nginx/nginx.conf` | Production nginx config: reverse proxy, rate limiting, WebSockets |
 | `cloudflare/config.yml` | Tunnel ingress rules for `example.com`, `www.`, `api.` + catch-all |
 | `scripts/setup-nginx.sh` | Installs nginx, deploys the config, validates and starts it |
 | `scripts/setup-cloudflare-tunnel.sh` | Installs `cloudflared`, authenticates, creates the tunnel, wires DNS |
 | `scripts/start-tunnel.sh` | Runs the tunnel in the foreground |
-| `docker-compose.yml` | Local test rig with three mock backends |
+| `scripts/start.sh` / `scripts/stop.sh` | Idempotent start/stop for the whole local stack (nginx + browser container + tunnel) |
+| `scripts/reset-browser.sh` | Wipes the browser container's profile/downloads back to a clean slate |
+| `docker-compose.yml` | Local test rig for `nginx.conf` itself, with three mock backends |
 | `docker/mock-backend/server.py` | Dependency-free mock backend (HTTP + WebSocket echo) |
+| `docker-compose.browser.yml` | **The actual production service**: a containerized, remotely-driven Firefox — see [Remote browser service](#remote-browser-service) below |
 
-Routing that the shipped config implements:
+Routing that the shipped config implements by default (the generic template):
 
 | Public URL | Goes to | Notes |
 | ---------- | ------- | ----- |
@@ -41,6 +44,44 @@ Routing that the shipped config implements:
 | `example.com/health` | nginx itself | liveness probe, no backend needed |
 | `api.example.com/*` | `127.0.0.1:5000` | the API on its own hostname |
 | anything else | — | connection dropped (`444`) |
+
+> The live `px.tinyorbit.org` deployment in this repo has diverged from this
+> generic multi-tier template — see [Remote browser service](#remote-browser-service).
+
+## Remote browser service
+
+`px.tinyorbit.org` doesn't run a generic app/api tier — the whole point of
+this deployment is a single containerized, web-accessible Firefox
+([`lscr.io/linuxserver/firefox`](https://docs.linuxserver.io/images/docker-firefox/))
+that a small, known group can drive from a browser tab to get online. Every
+byte of actual browsing (page content, downloads, any exploit a malicious
+site throws) stays inside that container's own throwaway storage — never the
+host's filesystem.
+
+| Piece | What it does |
+| ----- | ------------- |
+| `docker-compose.browser.yml` | Runs the container, loopback-only (`127.0.0.1:3000`), with resource limits (`2 CPUs` / `2GB` / `512 pids`), `no-new-privileges`, and a **named Docker volume** for `/config` — not a host bind mount, so nothing a session does becomes a file on this Mac |
+| `nginx/nginx.conf` | `px.tinyorbit.org`'s server block proxies everything (UI + the WebSocket stream that carries frames/input) straight to that container — see the file's own comments |
+| Cloudflare Access | Gates the hostname before traffic ever reaches the tunnel — email one-time-PIN login, allow-listed via the `Proxy-Users` reusable Access policy in the Zero Trust dashboard. Nginx itself has no auth logic; Access is the enforcement point |
+| `scripts/reset-browser.sh` | One command to wipe the shared profile/downloads/cookies and start clean |
+
+Known v1 limitations, not bugs:
+
+- **One shared session.** Everyone who logs in sees and drives the same
+  browser — there's no per-user isolation yet. Fine for a small trusted
+  group; a bigger group would want per-user ephemeral containers instead.
+- **LAN reachability.** The container can still reach other devices on the
+  local network (normal Docker bridge egress, the same as any browser on
+  this Mac could) — the isolation guarantee is specifically "the host's own
+  filesystem and processes are unreachable," not full network segmentation.
+
+Bring it up/down with the rest of the stack via `scripts/start.sh` /
+`scripts/stop.sh`, or directly:
+
+```bash
+docker compose -f docker-compose.browser.yml up -d --wait
+docker compose -f docker-compose.browser.yml down
+```
 
 ## Prerequisites
 

@@ -3,6 +3,14 @@
 How a request travels from a browser to your application, and what each hop is
 responsible for.
 
+> **This repo's live deployment (`px.tinyorbit.org`) diverges from the
+> generic multi-tier diagram below**: there is one backend, not four — a
+> containerized remote browser — and Cloudflare Access gates the hostname
+> before step ① even reaches the tunnel. See SETUP.md's
+> ["Remote browser service"](SETUP.md#remote-browser-service) for the actual
+> shape. The rest of this document (compression, real-IP restoration, the
+> tunnel mechanics) still applies unchanged.
+
 ## Traffic flow
 
 ```

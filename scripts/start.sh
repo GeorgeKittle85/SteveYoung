@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  start.sh — start the full local stack: nginx + the Cloudflare Tunnel.
+#  start.sh — start the full local stack: nginx + the browser container +
+#             the Cloudflare Tunnel.
 #
 #  Usage:
 #    ./scripts/start.sh
@@ -14,9 +15,12 @@
 # =============================================================================
 set -euo pipefail
 
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
 TUNNEL_CONFIG="${TUNNEL_CONFIG:-${HOME}/.cloudflared/config-px.yml}"
 TUNNEL_PID_FILE="${HOME}/.cloudflared/px-tunnel.pid"
 TUNNEL_LOG="${TUNNEL_LOG:-${HOME}/.cloudflared/px-tunnel.log}"
+BROWSER_COMPOSE="docker-compose.browser.yml"
 
 if [[ -t 1 ]]; then
     RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
@@ -53,7 +57,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-#  2. Cloudflare Tunnel
+#  2. Browser container
+# ---------------------------------------------------------------------------
+step "Browser container"
+command -v docker >/dev/null 2>&1 || die "docker is not installed."
+
+if [[ -n "$(docker compose -f "${BROWSER_COMPOSE}" ps --status running --quiet 2>/dev/null)" ]]; then
+    ok "Browser container already running."
+else
+    docker compose -f "${BROWSER_COMPOSE}" up -d --wait
+    ok "Browser container started."
+fi
+
+# ---------------------------------------------------------------------------
+#  3. Cloudflare Tunnel
 # ---------------------------------------------------------------------------
 step "Cloudflare Tunnel"
 command -v cloudflared >/dev/null 2>&1 || die "cloudflared is not installed. Run ./scripts/setup-cloudflare-tunnel.sh first."
@@ -78,7 +95,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-#  3. Smoke test
+#  4. Smoke test
 # ---------------------------------------------------------------------------
 step "Smoke test"
 if command -v curl >/dev/null 2>&1; then
@@ -86,6 +103,12 @@ if command -v curl >/dev/null 2>&1; then
         ok "nginx health check passed (Host: px.tinyorbit.org)."
     else
         warn "nginx did not answer yet. Check: sudo tail -f /var/log/nginx/error.log"
+    fi
+
+    if curl -fsS -m 5 http://127.0.0.1:3000/ >/dev/null 2>&1; then
+        ok "Browser container responding on 127.0.0.1:3000."
+    else
+        warn "Browser container did not answer yet. Check: docker logs px-browser"
     fi
 fi
 
