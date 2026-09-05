@@ -1,0 +1,11 @@
+{
+  "name": "px-relay",
+  "private": true,
+  "type": "module",
+  "description": "Wisp TCP relay for px. Runs inside the Cloudflare Container.",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": {
+    "@mercuryworkshop/wisp-js": "0.4.1"
+  }
+}

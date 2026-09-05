@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>px</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/scram/scramjet.all.js"></script>
+  <script src="/baremux/index.js"></script>
+  <script src="/proxy-setup.js"></script>
+</head>
+<body class="bootstrap">
+  <!--
+    Served by the Worker for any /scramjet/... URL that arrives without a
+    service worker in control (new profile, evicted worker, hard reload).
+    Install the worker, then load the same URL again through it.
+  -->
+  <main>
+    <p id="msg">Starting the proxy…</p>
+  </main>
+  <script>
+    (async function () {
+      var msg = document.getElementById("msg");
+      try {
+        await window.pxSetup();
+        if (navigator.serviceWorker.controller) {
+          location.reload();
+        } else {
+          // Older browsers only take control on the next navigation.
+          msg.textContent = "Proxy installed. Reloading…";
+          navigator.serviceWorker.addEventListener("controllerchange", function () { location.reload(); });
+          setTimeout(function () { location.reload(); }, 1500);
+        }
+      } catch (err) {
+        msg.textContent = "Could not start the proxy: " + (err && err.message ? err.message : err);
+      }
+    })();
+  </script>
+</body>
+</html>

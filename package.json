@@ -1,0 +1,46 @@
+{
+  "name": "px-proxy",
+  "version": "1.0.0",
+  "description": "px: a browser-side web proxy on Cloudflare Workers + a lite Container relay",
+  "scripts": {
+    "test": "npm run typecheck && node --test src/access.test.ts",
+    "build": "node scripts/sync-vendor.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "node scripts/e2e.mjs",
+    "dev": "wrangler dev",
+    "dev:local": "node scripts/dev-local.mjs",
+    "relay": "node container/server.mjs",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GeorgeKittle85/SteveYoung.git"
+  },
+  "license": "UNLICENSED",
+  "bugs": {
+    "url": "https://github.com/GeorgeKittle85/SteveYoung/issues"
+  },
+  "homepage": "https://github.com/GeorgeKittle85/SteveYoung#readme",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7",
+    "jose": "6.2.11"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260905.1",
+    "@mercuryworkshop/bare-mux": "2.1.9",
+    "@mercuryworkshop/epoxy-transport": "2.1.28",
+    "@mercuryworkshop/scramjet": "1.1.0",
+    "@mercuryworkshop/wisp-js": "0.4.1",
+    "@types/node": "26.4.1",
+    "playwright": "1.56.1",
+    "typescript": "7.0.2",
+    "wrangler": "4.129.0",
+    "ws": "8.21.3"
+  }
+}

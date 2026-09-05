@@ -1,200 +1,211 @@
 # Architecture
 
-How a request travels from a browser to your application, and what each hop is
-responsible for.
+How a page reaches a user of `px.tinyorbit.org`, what each hop does, and why
+the container needs almost no CPU.
 
-> **This repo's live deployment (`px.tinyorbit.org`) diverges from the
-> generic multi-tier diagram below**: there is one backend, not four — a
-> containerized remote browser — and Cloudflare Access gates the hostname
-> before step ① even reaches the tunnel. See SETUP.md's
-> ["Remote browser service"](SETUP.md#remote-browser-service) for the actual
-> shape. The rest of this document (compression, real-IP restoration, the
-> tunnel mechanics) still applies unchanged.
+- Setup, cost table, tuning and operations: [README.md](README.md)
+
+## The one-line version
+
+The old design streamed *pixels* of a browser running in a container. The new
+design streams *bytes* to a browser running on the user's machine. Rendering
+is the expensive part, and it now happens where it is free.
 
 ## Traffic flow
 
 ```
-        ┌──────────────┐
-        │   Browser    │  https://example.com
-        └──────┬───────┘
-               │  ① HTTPS (TLS to Cloudflare's certificate)
-               ▼
-   ┌───────────────────────────┐
-   │   Cloudflare edge (PoP)   │   DNS · TLS termination · WAF · DDoS
-   │   nearest to the visitor  │   caching · bot filtering
-   └───────────┬───────────────┘
-               │  ② encrypted tunnel over QUIC/HTTP2
-               │     (outbound-only, mutually authenticated)
-               ▼
- ═══════════════════════════════════════════════════════════ your host ═══
-   ┌───────────────────────────┐
-   │  cloudflared (daemon)     │   matches ingress rules from config.yml
-   │  ~/.cloudflared/config.yml│   → picks a local service per hostname
-   └───────────┬───────────────┘
-               │  ③ plain HTTP to 127.0.0.1:80
-               ▼
-   ┌───────────────────────────┐
-   │  nginx                    │   vhost + path routing · rate limiting
-   │  /etc/nginx/nginx.conf    │   load balancing · caching · WebSocket
-   └───────────┬───────────────┘   upgrade · real-IP restoration
-               │  ④ plain HTTP to loopback ports
-     ┌─────────┼──────────┬─────────────┐
-     ▼         ▼          ▼             ▼
- ┌────────┐ ┌────────┐ ┌────────┐  ┌──────────┐
- │ :3000  │ │ :3001  │ │ :5000  │  │  :3000/1 │
- │ app-1  │ │ app-2  │ │  api   │  │ websocket│
- └────────┘ └────────┘ └────────┘  └──────────┘
-  app_backend (least_conn)  api_backend   ws_backend (sticky)
+ ┌────────────────────────────────────────── user's browser ──────────────────────────────────────────┐
+ │  px shell (public/index.html, app.js)                                                             │
+ │     └─ <iframe> /scramjet/<encoded url>   ← proxied page renders here, like any web page          │
+ │                                                                                                    │
+ │  service worker (public/sw.js + Scramjet)  ← intercepts every fetch the page makes,               │
+ │     │                                         rewrites URLs / HTML / JS / CSS so they stay          │
+ │     ▼                                         inside this origin                                    │
+ │  SharedWorker (bare-mux) → epoxy transport ← HTTP + TLS client compiled to WASM: talks TLS          │
+ │     │                                         to the destination site, end to end                   │
+ └─────┼──────────────────────────────────────────────────────────────────────────────────────────────┘
+       │ ① one WebSocket: wss://px.tinyorbit.org/wisp/   (Wisp: many TCP streams multiplexed)
+       ▼
+ ┌────────────────────────────────┐
+ │ Cloudflare edge                │  TLS · WAF · Cloudflare Access login (email OTP, Proxy-Users policy)
+ └───────────────┬────────────────┘
+                 │ ② request + Cf-Access-Jwt-Assertion header
+                 ▼
+ ┌────────────────────────────────┐
+ │ Worker  (src/index.ts)         │  verifies the Access JWT (issuer, audience, signature, expiry)
+ │                                │  serves public/ from Static Assets
+ │                                │  /wisp/  → getContainer(RELAY, sha256(email))
+ └───────────────┬────────────────┘
+                 │ ③ WebSocket, relayed frame by frame through the Durable Object
+                 ▼
+ ┌────────────────────────────────┐
+ │ WispRelay  (src/relay.ts)      │  Durable Object: starts / stops the container, idle timer
+ │   └─ container  (container/)   │  Node 22 + wisp-js: one WebSocket in, N TCP sockets out
+ └───────────────┬────────────────┘  `lite` instance: 1/16 vCPU, 256 MiB
+                 │ ④ plain TCP, opaque TLS bytes
+                 ▼
+          destination websites
 ```
 
 ```mermaid
-flowchart TD
-    B["Browser<br/>https://example.com"] -->|"① HTTPS"| CF["Cloudflare edge<br/>TLS · WAF · DDoS · cache"]
-    CF -->|"② encrypted tunnel<br/>outbound-only QUIC"| CD["cloudflared<br/>ingress rules"]
-
-    subgraph HOST["Your host — no inbound ports open"]
-        CD -->|"③ http://localhost:80"| NG["nginx<br/>routing · rate limit · LB"]
-        NG -->|"/ and static"| A1[":3000 app-1"]
-        NG -->|"/ and static"| A2[":3001 app-2"]
-        NG -->|"/api/ · api.example.com"| API[":5000 api"]
-        NG -->|"/ws/ (sticky)"| WS[":3000 / :3001<br/>websocket"]
+flowchart LR
+    subgraph B["User's browser"]
+        UI["px shell<br/>iframe"] --> SW["service worker<br/>Scramjet rewriter"]
+        SW --> TX["bare-mux + epoxy<br/>HTTP/TLS in WASM"]
     end
+    TX -->|"① wss://…/wisp/ (Wisp)"| CF["Cloudflare edge<br/>Access login"]
+    CF -->|"② JWT header"| W["Worker<br/>verify JWT · assets · route"]
+    W -->|"③ WebSocket via DO"| R["WispRelay container<br/>lite · wisp-js"]
+    R -->|"④ TCP"| S["destination sites"]
 ```
 
 ## What each hop does
 
-### ① Browser → Cloudflare edge
+### ① Browser: rendering, rewriting, TLS
 
-DNS for `example.com` is a **proxied CNAME** pointing at
-`<tunnel-id>.cfargotunnel.com`. Because the record is proxied (orange cloud),
-the name resolves to Cloudflare anycast IPs, so the visitor connects to the
-Cloudflare data centre closest to them — never to your host, whose address is
-never published.
+Everything CPU-heavy lives here:
 
-TLS terminates here, using Cloudflare's certificate. Your origin needs no
-certificate, no renewal cron, and no port 443.
+- **Scramjet** runs in a service worker. It intercepts each request the
+  proxied page makes, fetches it through the transport, and rewrites the
+  response (URLs in HTML/CSS, `location`/`document.domain`/`fetch` and friends
+  in JavaScript) so the page keeps working under `/scramjet/…` on our origin.
+  Cookies and storage for proxied sites are emulated per site inside the
+  browser's own IndexedDB.
+- **epoxy** is an HTTP client with its own TLS stack (Rust → WASM). It opens
+  the TLS session to the destination *inside the browser*, so the relay only
+  ever sees ciphertext. Certificate validation happens here too.
+- **bare-mux** keeps the transport in a SharedWorker so every tab, iframe and
+  the service worker share one Wisp connection.
 
-### ② Cloudflare edge → cloudflared
+The result is that the container is not "a browser"; it is a NAT box.
 
-This is the important bit. **`cloudflared` dials out to Cloudflare; Cloudflare
-never dials in.** The daemon opens four long-lived, mutually authenticated
-QUIC connections (spread across two data centres for redundancy) and requests
-are multiplexed back down them.
+### ② Cloudflare edge
 
-Consequences:
+`px.tinyorbit.org` is a Worker custom domain. Cloudflare terminates TLS and
+the Access application on the hostname forces a login before anything reaches
+the Worker. Access then adds a signed JWT (`Cf-Access-Jwt-Assertion`) to every
+request, including the WebSocket upgrade.
 
-- **No inbound firewall rule, no port forwarding, no public IP.** The host can
-  sit behind NAT or a restrictive firewall with every inbound port closed.
-- **The origin IP is unpublishable**, so direct-to-origin DDoS and origin
-  scanning are not possible.
-- If the tunnel drops, `cloudflared` reconnects on its own and Cloudflare
-  serves an error page in the meantime.
+### ③ Worker → Durable Object → container
 
-`cloudflared` then consults the `ingress` list in `config.yml`, top to bottom,
-and forwards the request to the first rule whose hostname matches. All three
-hostnames in this setup point at `http://localhost:80` — nginx — so routing
-decisions live in one file rather than two.
+The Worker (`src/index.ts`) checks the JWT on **every** request, so even if
+the hostname's Access policy were removed by mistake the container could not
+be reached (`workers_dev` and preview URLs are disabled for the same reason).
+Static files come from Workers Static Assets, served at the edge and never
+touching the container.
 
-### ③ cloudflared → nginx
+`/wisp/` is the only path that reaches a container. `getContainer(env.RELAY,
+name)` picks a Durable Object per user (`sha256(email)`; or one shared object
+with `RELAY_MODE=shared`), and `@cloudflare/containers` does the rest:
 
-Plain HTTP over loopback. Encrypting this hop would be pointless: it never
-leaves the machine. Cloudflare's original request headers are preserved,
-including:
+- starts the container on first use and waits for port 8080;
+- relays the WebSocket through the object, renewing the idle timer on each
+  frame, so a session in use never sleeps;
+- stops the container `sleepAfter` (`RELAY_SLEEP_AFTER`, 5 min) after the last
+  frame, at which point billing stops. The next connect cold-starts it in a
+  few seconds; the browser-side transport reconnects by itself.
 
-| Header              | Meaning                                            |
-| ------------------- | -------------------------------------------------- |
-| `CF-Connecting-IP`  | the visitor's real IP address                       |
-| `CF-Ray`            | request ID, searchable in the Cloudflare dashboard  |
-| `X-Forwarded-Proto` | `https` — what the *browser* used                   |
-| `CF-IPCountry`      | visitor's country (when enabled)                    |
+### ④ The relay
 
-### ④ nginx → backends
+`container/server.mjs` is ~80 lines around `@mercuryworkshop/wisp-js`. For
+each Wisp `CONNECT` packet it opens a TCP socket to `host:port` and shuttles
+bytes both ways, with per-stream flow control (128-packet windows, sockets
+paused when the browser is slower than the site). Guard rails:
 
-nginx is where per-request policy is applied. In order:
+| Rule                                   | Why                                                          |
+| -------------------------------------- | ------------------------------------------------------------ |
+| TCP only, no UDP                       | Browsing does not need it; avoids a generic UDP forwarder    |
+| Private and loopback IPs refused       | A page cannot probe the container's network                  |
+| Port 25 refused                        | No spam relaying                                             |
+| 256 streams per WebSocket              | A runaway page cannot exhaust the relay                      |
+| Logs at WARN, no client IP parsing     | Nothing identifying is written inside the container          |
+| `uncaughtException` handler            | One bad stream cannot kill everyone's session                |
 
-1. **Real IP restoration.** Every request arrives from `127.0.0.1`, so without
-   `set_real_ip_from` / `real_ip_header CF-Connecting-IP`, access logs would
-   show only the loopback address and — worse — every visitor would share a
-   single rate-limit bucket. This is why the `real_ip` block comes first.
+## Why the CPU is tiny
 
-2. **Virtual host selection** by `Host` header:
-   `example.com` / `www.example.com` → the app vhost, `api.example.com` → the
-   API vhost, anything else → `return 444` (connection dropped, no response).
+| Design                      | Work done in the container per page                                    | Steady-state CPU                     |
+| --------------------------- | ---------------------------------------------------------------------- | ------------------------------------ |
+| Firefox + Xvfb + KasmVNC    | fetch, TLS, parse, layout, JS, paint, composite, capture, video-encode, audio | 1–2 cores while a tab is doing anything; never idle (screen polling) |
+| Wisp relay (this design)    | copy ciphertext between a WebSocket and TCP sockets                    | measured below                       |
 
-3. **Location matching**, in nginx's fixed precedence order:
+Measured by `scripts/e2e.mjs` (Node 22, headless Chromium, everything on
+loopback so the numbers are relay cost only):
 
-   | Order | Location                     | Goes to                     |
-   | ----- | ---------------------------- | --------------------------- |
-   | 1     | `= /health`                  | answered by nginx itself     |
-   | 2     | `^~ /api/`                   | `api_backend` (rate limited) |
-   | 2     | `^~ /ws/`                    | `ws_backend` (upgraded)      |
-   | 3     | `~* \.(css\|js\|png\|…)$`    | `app_backend`, cached hard   |
-   | 4     | `/`                          | `app_backend`                |
+| Scenario                              | Relay CPU                 | Notes                                          |
+| ------------------------------------- | ------------------------- | ---------------------------------------------- |
+| Idle with a session open, 5 s         | 10 ms (0.2% of a core)    | Wisp keepalives only                           |
+| Page with 150 image requests          | 40–50 ms → ~0.3 ms/request | HTTP keep-alive means few TCP streams          |
+| 32 MB download                        | 230–310 ms → 7–10 ms/MB   | 35 MB/s on loopback, 25–35% of one core        |
+| Resident memory                       | 75 MB idle, 120 MB peak   | V8 heap capped at 128 MB; buffers are bounded  |
 
-   The `^~` markers on `/api/` and `/ws/` matter: without them the static-asset
-   regex would win for a path like `/api/v1/report.json` and send an API call to
-   the app tier.
+A `lite` instance gets 1/16 of a vCPU: 62.5 CPU-ms per wall second. At 7–10
+ms/MB that sustains ≈ 6–9 MB/s (≈ 50–70 Mbit/s) before throttling, and a page
+load of a few hundred requests costs well under 100 ms of CPU. Throttling degrades
+gracefully (slower transfers), it does not fail.
 
-4. **Rate limiting** on `/api/` only — 10 r/s sustained per client IP with a
-   burst of 20, then `429`.
+If a shared relay serves many people at once, or usage is video-heavy, `basic`
+(1/4 vCPU, 1 GiB) is the next step and is still a fraction of `standard-3`.
 
-5. **Load balancing.** `app_backend` uses `least_conn` across `:3000` and
-   `:3001`; `ws_backend` uses `hash $binary_remote_addr consistent` so a socket
-   keeps talking to the node holding its session. (`ip_hash` would be useless
-   here — every connection appears to come from `127.0.0.1`, so all sockets
-   would land on one node.)
+## Lifecycle of a session
 
-6. **Passive health checks.** A backend that fails twice within `fail_timeout`
-   is pulled out of rotation for 15 seconds, and `proxy_next_upstream` retries
-   the request on a surviving node, so a single dead backend is invisible to
-   users.
+1. User opens `https://px.tinyorbit.org`; Access logs them in; the Worker
+   serves `index.html`.
+2. `proxy-setup.js` initialises Scramjet (config is stored in IndexedDB for
+   the service worker), registers `/sw.js`, and tells bare-mux to load the
+   epoxy transport with `wss://px.tinyorbit.org/wisp/`.
+3. The user types an address. `app.js` creates a Scramjet frame and navigates
+   it to `/scramjet/<encoded url>`.
+4. The service worker intercepts that navigation, asks the transport for the
+   page; epoxy opens the WebSocket (cookie → Access → Worker → Durable Object
+   → container starts if needed) and a Wisp stream to the site, does TLS,
+   sends the HTTP request.
+5. Response bytes flow back over the same WebSocket; Scramjet rewrites the
+   HTML; the iframe renders it; every subresource repeats step 4 over the
+   existing WebSocket (new Wisp streams, or reused keep-alive connections).
+6. When the tab closes, the WebSocket closes; five minutes later the Durable
+   Object stops the container.
 
-## Request lifecycle example
+A proxied URL that reaches the Worker directly (new browser profile, evicted
+service worker) gets `bootstrap.html`, which installs the worker and reloads.
 
-`GET https://example.com/api/v1/users` from a visitor in Berlin:
+## Security model
 
-1. DNS returns Cloudflare anycast IPs; the browser connects to the Frankfurt PoP.
-2. TLS terminates at the edge; WAF rules and DDoS protection run.
-3. The edge finds a healthy tunnel connection and forwards the request.
-4. `cloudflared` matches `hostname: example.com` and proxies to `localhost:80`.
-5. nginx restores the real IP from `CF-Connecting-IP`, selects the
-   `example.com` vhost, matches `^~ /api/`.
-6. The rate limiter checks this visitor's bucket. Over budget → `429`, done.
-7. Under budget → proxied to `127.0.0.1:5000` with `X-Real-IP`,
-   `X-Forwarded-For`, `X-Forwarded-Proto: https` and a generated `X-Request-ID`.
-8. The response travels back up the same path. nginx logs it with the upstream
-   address, timing and `CF-Ray`.
-
-## Why this shape
-
-| Concern                  | Handled by                | Why there                                               |
-| ------------------------ | ------------------------- | ------------------------------------------------------- |
-| TLS certificates         | Cloudflare edge           | free, auto-renewing, nothing to maintain on the host     |
-| DDoS / WAF / bot filter  | Cloudflare edge           | absorbed before it ever reaches your bandwidth           |
-| Exposure of the origin   | Tunnel (outbound-only)    | no inbound ports means no attack surface to scan         |
-| Host/path routing        | nginx                     | one file to change when a backend moves                  |
-| Rate limiting            | nginx                     | needs the real client IP, restored one hop earlier       |
-| Load balancing, failover | nginx                     | closest to the backends, fastest to react                |
-| Static caching           | nginx + Cloudflare        | nginx sets the headers; the edge honours them globally   |
+| Concern                                    | Handled by                                                    |
+| ------------------------------------------ | ------------------------------------------------------------- |
+| Who may use it                             | Cloudflare Access (edge) **and** JWT verification in the Worker |
+| Can the container be reached without login | No: every non-`/health` route requires a valid JWT; no workers.dev route |
+| Can a page read other users' traffic       | No: per-user relays; TLS ends in the user's own browser        |
+| Can a page attack the relay's network      | No: private/loopback destinations refused, UDP off, port 25 off |
+| Can the relay see page content             | No: it carries TLS ciphertext                                  |
+| Can the relay see who the user is          | No: the Worker strips cookies/JWT before forwarding; the relay logs no client IPs |
+| Where does page JavaScript run             | In the user's browser sandbox, under the proxy origin (see README limitations) |
+| Does anything touch the Mac                | No: the host stack is gone                                     |
 
 ## Failure modes
 
-| What breaks            | Symptom                          | Who reports it            |
-| ---------------------- | -------------------------------- | ------------------------- |
-| A backend dies         | nothing visible; traffic shifts  | nginx `error.log`         |
-| All app backends die   | `502` / custom `50x` page        | nginx `error.log`         |
-| nginx is stopped       | `502` from Cloudflare            | `journalctl -u cloudflared` |
-| `cloudflared` stopped  | Cloudflare error 1033            | Cloudflare dashboard      |
-| DNS record not proxied | `1016 Origin DNS error`          | Cloudflare dashboard      |
+| What breaks                     | Symptom                                    | Where to look                                   |
+| ------------------------------- | ------------------------------------------ | ----------------------------------------------- |
+| Access misconfigured            | `503 px is not configured yet`             | `wrangler.jsonc` vars                            |
+| Token rejected                  | `403 Forbidden: invalid …`                 | `wrangler tail` (reason is logged)               |
+| Container cannot start          | `503 There is no Container instance …`     | `max_instances`, Containers dashboard            |
+| Relay crashes                   | Wisp socket drops; transport reconnects; cold start | `wrangler tail` (`relay … stopped`)      |
+| Site blocks datacenter IPs      | Captcha or 403 inside the frame            | Nothing to fix here; different site or search engine |
+| Site breaks under rewriting     | Blank frame / JS errors                    | Scramjet issue tracker; try another site         |
 
-## Scaling this
+## Alternatives considered
 
-- **More app instances** — add `server 127.0.0.1:3002;` to the `app_backend`
-  upstream and reload. `least_conn` picks it up immediately.
-- **More API workers** — same, in `api_backend`.
-- **Multiple hosts** — run `cloudflared` on each with the *same tunnel name*.
-  Cloudflare load balances across every connected replica automatically.
-- **Backends on other machines** — replace `127.0.0.1:3000` with the private
-  address, and consider TLS for that hop since it now leaves the host.
-
-See [SETUP.md](SETUP.md) for installation, DNS configuration and troubleshooting.
+- **Keep a real browser, smaller instance.** A desktop browser needs ~1 GiB
+  and a real core just to idle; `basic` is too small and `standard-1` still
+  encodes video for every frame. Costs stay in the same order as before.
+- **No container at all (Worker-only relay with `connect()`).** Workers cannot
+  open raw TCP to Cloudflare IP ranges, which rules out a large fraction of
+  the web. A Worker-only *HTTP* proxy (`fetch()`-based bare server) is
+  possible but weaker: no WebSockets to arbitrary hosts, and the site sees
+  Worker egress. The container relay keeps full TCP semantics.
+- **Rust relay (`epoxy-server`).** Lower CPU and memory than Node, but it
+  needs a Rust toolchain in the image build. The Node relay already fits
+  `lite` with margin; swap later if usage grows.
+- **Ultraviolet instead of Scramjet.** Ultraviolet is unmaintained; its
+  authors point to Scramjet. Scramjet 1.x (stable) is used with the matching
+  bare-mux 2 and epoxy-transport 2 generation (epoxy-transport 3 targets the
+  newer proxy-transports interface and is not compatible).
