@@ -1,0 +1,7 @@
+# Copy to `.dev.vars` for `wrangler dev`. Wrangler only reads this file for
+# local development; it is never deployed.
+#
+# Skips the Cloudflare Access check. src/index.ts honours it ONLY while
+# ACCESS_TEAM_DOMAIN / ACCESS_AUD in wrangler.jsonc are still placeholders,
+# so it cannot weaken a configured deployment.
+ACCESS_DEV_BYPASS=1
