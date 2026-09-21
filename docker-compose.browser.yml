@@ -77,10 +77,13 @@ services:
       - KILL             # s6 supervising and stopping services
 
     # Bound so a hostile page can't turn this into a resource-exhaustion
-    # vector for the rest of the host. Docker Desktop's VM only has 4 CPUs /
-    # ~5.8GiB total here, shared with other containers.
-    mem_limit: "2g"
-    cpus: "2.0"
+    # vector for the rest of the host. The engine is a Colima VM
+    # (~/.colima/default/colima.yaml: cpu 4, memory 4 GiB), so this limit
+    # must stay below the VM's memory or it never fires and the VM-wide OOM
+    # killer picks the victim instead. Firefox with a few heavy tabs was
+    # measured at 1.6 GiB, so 2g was too tight.
+    mem_limit: "3g"
+    cpus: "4.0"
     pids_limit: 512
 
     # A named volume, NOT a host bind mount: the Firefox profile, cache and

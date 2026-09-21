@@ -145,7 +145,8 @@ ok "Config installed."
 # `main` log_format — see SETUP.md's "Logs and monitoring"). Distro packages
 # create this directory themselves; Homebrew's nginx on macOS does not, so
 # `nginx -t` fails with "open() ... failed (2: No such file or directory)"
-# unless it exists first.
+# unless it exists first. On macOS it also does not survive an OS upgrade, so
+# start.sh recreates it too — this line only covers the first install.
 $SUDO mkdir -p /var/log/nginx
 
 # Distro packages ship a default vhost that binds :80 as well. This config is

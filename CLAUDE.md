@@ -44,8 +44,19 @@ Internet -> Cloudflare edge (Access login) -> Cloudflare Tunnel
   (`api.tools-for-students.com`, `demo.stardatastorage.com`) pointing at
   `localhost:8000` and `:8020` — they do not route through nginx, but
   `scripts/stop.sh` and `setup-nginx.sh` still act on host-wide services.
-- `sudo` requires an interactive password here, so nginx deploys and reloads
-  cannot be automated. Hand the user the command instead.
+- **`sudo` is passwordless for exactly three nginx commands**, granted by
+  `/etc/sudoers.d/nginx-deploy` (not in this repo): the `install`, `nginx -t`
+  and `nginx -s reload` lines under "Deploying" below. sudo resolves a bare
+  command name through `PATH`, but arguments are matched literally — so
+  `nginx -s stop`, `nginx -s quit`, or `install` with a relative
+  `nginx/nginx.conf` path all fall back to a password prompt. Every other
+  `sudo` on this host (including `start.sh`'s `sudo nginx` and `stop.sh`'s
+  `nginx -s quit`) still needs an interactive password; hand the user the
+  command instead. Always pass `sudo -n` so a non-matching command fails at
+  once rather than hanging. `sudo -l <cmd>` cannot tell you whether a command
+  is passwordless (it answers "permitted at all", and `skrbek` is an admin), and
+  `nginx -t` is the only one of the three that is safe to run as a probe — the
+  `install` line *is* a deploy.
 
 ## Verifying a change
 
@@ -71,8 +82,12 @@ docker exec px-browser sh -c 'grep ^CapEff /proc/self/status'   # expect 0000000
 
 ## Deploying
 
+These three `sudo` lines are the only passwordless ones (see "Working here");
+the `install` overwrites the live config, so check `nginx/nginx.conf` for
+uncommitted drift first.
+
 ```bash
-sudo install -m 0644 nginx/nginx.conf /opt/homebrew/etc/nginx/nginx.conf \
-  && sudo nginx -t && sudo nginx -s reload
+sudo -n /usr/bin/install -m 0644 /Users/skrbek/SteveYoung/nginx/nginx.conf /opt/homebrew/etc/nginx/nginx.conf \
+  && sudo -n /opt/homebrew/bin/nginx -t && sudo -n /opt/homebrew/bin/nginx -s reload
 docker compose -f docker-compose.browser.yml up -d --wait
 ```

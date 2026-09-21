@@ -51,6 +51,12 @@ command -v nginx >/dev/null 2>&1 || die "nginx is not installed. Run ./scripts/s
 if pgrep -f "nginx: master process" >/dev/null 2>&1; then
     ok "nginx already running."
 else
+    # nginx.conf logs to /var/log/nginx/, which nothing on macOS owns: Homebrew
+    # does not create it and a macOS upgrade removes it again, after which
+    # `nginx -t` fails with `open() "/var/log/nginx/error.log" failed (2: No
+    # such file or directory)`. setup-nginx.sh creates it on first install;
+    # recreate it here so the stack still comes up after the next OS upgrade.
+    [[ -d /var/log/nginx ]] || $SUDO mkdir -p /var/log/nginx || die "Could not create /var/log/nginx"
     $SUDO nginx -t || die "nginx config is invalid — run: sudo nginx -t"
     $SUDO nginx
     ok "nginx started."
@@ -90,7 +96,13 @@ else
         ok "Tunnel started (pid $(cat "${TUNNEL_PID_FILE}")). Logging to ${TUNNEL_LOG}"
     else
         rm -f "${TUNNEL_PID_FILE}"
-        die "Tunnel failed to start — check ${TUNNEL_LOG}"
+        err "Tunnel failed to start. Last lines of ${TUNNEL_LOG}:"
+        tail -n 15 "${TUNNEL_LOG}" >&2 || true
+        # The usual cause on this host is a metrics-port clash: the other
+        # cloudflared instances here do not pin `metrics:`, so they auto-assign
+        # from 20241-20245 and can take a port this tunnel pins. Check with:
+        #   lsof -nP -iTCP:<port> -sTCP:LISTEN
+        die "Tunnel failed to start — see the log output above."
     fi
 fi
 
@@ -105,11 +117,16 @@ if command -v curl >/dev/null 2>&1; then
         warn "nginx did not answer yet. Check: sudo tail -f /var/log/nginx/error.log"
     fi
 
-    if curl -fsS -m 5 http://127.0.0.1:3000/ >/dev/null 2>&1; then
-        ok "Browser container responding on 127.0.0.1:3000."
-    else
-        warn "Browser container did not answer yet. Check: docker logs px-browser"
-    fi
+    # The container answers / with its own basic-auth challenge, so 401 is the
+    # healthy response and the only one we accept: a 200 here would mean the
+    # origin login is gone and Access is the only thing left guarding it.
+    # (`curl -f` is wrong for this check — it treats the correct 401 as failure.)
+    browser_code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:3000/ || true)"
+    case "${browser_code}" in
+        401) ok "Browser container responding on 127.0.0.1:3000 (401, origin auth enforced)." ;;
+        000) warn "Browser container did not answer. Check: docker logs px-browser" ;;
+        *)   warn "Browser container answered ${browser_code}, expected 401 — is its login still configured? Check: docker logs px-browser" ;;
+    esac
 fi
 
 echo

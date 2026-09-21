@@ -70,7 +70,7 @@ internet. Read the isolation as "the host's filesystem is unreachable", not
 
 | Piece | What it does |
 | ----- | ------------- |
-| `docker-compose.browser.yml` | Runs the container, loopback-only (`127.0.0.1:3000`), with resource limits (`2 CPUs` / `2GB` / `512 pids`), `no-new-privileges`, and a **named Docker volume** for `/config` — not a host bind mount, so nothing a session does becomes a file on this Mac |
+| `docker-compose.browser.yml` | Runs the container, loopback-only (`127.0.0.1:3000`), with resource limits (`4 CPUs` / `3GB` / `512 pids`), `no-new-privileges`, and a **named Docker volume** for `/config` — not a host bind mount, so nothing a session does becomes a file on this Mac |
 | `nginx/nginx.conf` | `px.tinyorbit.org`'s server block proxies everything (UI + the WebSocket stream that carries frames/input) straight to that container — see the file's own comments |
 | Cloudflare Access | Gates the hostname at the Cloudflare **edge** — email one-time-PIN login, allow-listed via the `Proxy-Users` reusable Access policy in the Zero Trust dashboard. This is the front door, but it only sees traffic that arrives through Cloudflare |
 | Container login (`.env`) | The origin-side gate. `CUSTOM_USER` / `PASSWORD` from a gitignored `.env` put HTTP basic auth on the container itself, so reaching port 3000 or nginx directly — which any process on this Mac and any other container can do — is not enough to drive the browser. Expect to enter it once after the Access login |
@@ -643,6 +643,20 @@ set_real_ip_from 172.16.0.0/12;
 
 Only ever trust addresses you control — trusting a public range would let
 anyone spoof `CF-Connecting-IP` and evade the rate limit.
+
+### `nginx -t` fails with `open() "/var/log/nginx/error.log" failed (2: No such file or directory)`
+
+The config writes its logs to `/var/log/nginx/`. Distro packages create that
+directory; Homebrew's nginx on macOS does not, and a macOS upgrade has been seen
+to remove it again. Recreate it and retry:
+
+```bash
+sudo mkdir -p /var/log/nginx
+sudo nginx -t
+```
+
+`scripts/start.sh` does this itself before starting nginx, so the stack comes
+back up after an upgrade without manual steps.
 
 ### `nginx -t` fails with `getpwnam("nginx") failed`
 

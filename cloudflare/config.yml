@@ -26,13 +26,24 @@ credentials-file: REPLACE_WITH_CREDENTIALS_PATH
 
 # --- Connection tuning -------------------------------------------------------
 # Four edge connections (the default) spread over two Cloudflare data centres.
-protocol: quic
+# "http2" (TCP), not "quic" or "auto": this host is on Wi-Fi and its UDP/7844
+# path to Cloudflare only half-works. cloudflared's own precheck reports
+# "UDP Connectivity: QUIC connection failed", yet "auto" still lands every
+# connection on QUIC, where it then sees steady packet loss and periodic
+# "timeout: no recent network activity" drops that kill the browser's
+# websocket mid-session. Pinning http2 takes UDP out of the picture.
+protocol: http2
 loglevel: info
 transport-loglevel: warn
 no-autoupdate: true
-metrics: 127.0.0.1:20242        # Prometheus metrics + /ready health endpoint
-                                # Must be unique per tunnel on a host that runs
-                                # several; 20241 is taken by another tunnel here.
+# Prometheus metrics + /ready health endpoint. Must be unique per tunnel on a
+# host that runs several — and must sit OUTSIDE 20241-20245, which is the range
+# cloudflared auto-assigns from when a config omits `metrics:` (the defaults are
+# compiled into the binary: `strings $(command -v cloudflared) | grep 20241`).
+# A pinned port inside that range is a race: the other tunnels on this host do
+# not pin one, so whichever starts first can take it, and this tunnel then dies
+# at startup with "bind: address already in use" instead of falling back.
+metrics: 127.0.0.1:20250
 retries: 5
 grace-period: 30s
 
